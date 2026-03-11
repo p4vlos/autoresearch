@@ -1,389 +1,452 @@
 """
-One-time data preparation for autoresearch experiments.
-Downloads data shards and trains a BPE tokenizer.
+GLOBEM data preparation for autoresearch experiments.
+Loads mobile sensing data, constructs 28-day windows for depression prediction.
+
+Expected data layout in DATA_DIR:
+    INS-W_1/  (or any subdirectory per dataset)
+        FeatureData/
+            rapids.csv          # columns: pid, date, feature1, feature2, ...
+        SurveyData/
+            dep_weekly.csv      # columns: pid, date, dep_endtotal
 
 Usage:
-    python prepare.py                  # full prep (download + tokenizer)
-    python prepare.py --num-shards 8   # download only 8 shards (for testing)
+    python prepare.py                    # prepare with default DATA_DIR
+    python prepare.py --data-dir PATH    # custom data directory
 
-Data and tokenizer are stored in ~/.cache/autoresearch/.
+Cached tensors are stored in ~/.cache/autoresearch/.
 """
 
 import os
 import sys
-import time
-import math
 import argparse
-import pickle
-from multiprocessing import Pool
+import glob
 
-import requests
-import pyarrow.parquet as pq
-import rustbpe
-import tiktoken
+import numpy as np
+import pandas as pd
 import torch
 
 # ---------------------------------------------------------------------------
-# Constants (fixed, do not modify)
+# Constants (fixed, do not modify — imported by train.py)
 # ---------------------------------------------------------------------------
 
-MAX_SEQ_LEN = 2048       # context length
-TIME_BUDGET = 300        # training time budget in seconds (5 minutes)
-EVAL_TOKENS = 40 * 524288  # number of tokens for val eval
+WINDOW_DAYS = 28          # days in each input window
+NUM_CLASSES = 2           # binary: depressed / not depressed
+TIME_BUDGET = 300         # training time budget in seconds (5 minutes)
+DEP_THRESHOLD = 2         # PHQ-4 score > threshold = positive (depressed)
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
+DATA_DIR = os.path.expanduser("~/data/globem")
 CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch")
-DATA_DIR = os.path.join(CACHE_DIR, "data")
-TOKENIZER_DIR = os.path.join(CACHE_DIR, "tokenizer")
-BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
-MAX_SHARD = 6542 # the last datashard is shard_06542.parquet
-VAL_SHARD = MAX_SHARD  # pinned validation shard (shard_06542)
-VAL_FILENAME = f"shard_{VAL_SHARD:05d}.parquet"
-VOCAB_SIZE = 8192
+TEST_RATIO = 0.2          # per-user train/test split ratio
 
-# BPE split pattern (GPT-4 style, with \p{N}{1,2} instead of {1,3})
-SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
-
-SPECIAL_TOKENS = [f"<|reserved_{i}|>" for i in range(4)]
-BOS_TOKEN = "<|reserved_0|>"
+# Will be set after data loading
+N_FEATURES = None         # number of features per day (set by load_and_cache)
 
 # ---------------------------------------------------------------------------
-# Data download
+# Data loading
 # ---------------------------------------------------------------------------
 
-def download_single_shard(index):
-    """Download one parquet shard with retries. Returns True on success."""
-    filename = f"shard_{index:05d}.parquet"
-    filepath = os.path.join(DATA_DIR, filename)
-    if os.path.exists(filepath):
-        return True
-
-    url = f"{BASE_URL}/{filename}"
-    max_attempts = 5
-    for attempt in range(1, max_attempts + 1):
-        try:
-            response = requests.get(url, stream=True, timeout=30)
-            response.raise_for_status()
-            temp_path = filepath + ".tmp"
-            with open(temp_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-            os.rename(temp_path, filepath)
-            print(f"  Downloaded {filename}")
-            return True
-        except (requests.RequestException, IOError) as e:
-            print(f"  Attempt {attempt}/{max_attempts} failed for {filename}: {e}")
-            for path in [filepath + ".tmp", filepath]:
-                if os.path.exists(path):
-                    try:
-                        os.remove(path)
-                    except OSError:
-                        pass
-            if attempt < max_attempts:
-                time.sleep(2 ** attempt)
-    return False
+def find_datasets(data_dir):
+    """Find dataset subdirectories that contain FeatureData/rapids.csv."""
+    datasets = []
+    for entry in sorted(os.listdir(data_dir)):
+        path = os.path.join(data_dir, entry)
+        if not os.path.isdir(path):
+            continue
+        rapids = os.path.join(path, "FeatureData", "rapids.csv")
+        if os.path.exists(rapids):
+            datasets.append(entry)
+    if not datasets:
+        # Try looking for rapids.csv directly in data_dir
+        direct = os.path.join(data_dir, "rapids.csv")
+        if os.path.exists(direct):
+            datasets.append(".")
+    return datasets
 
 
-def download_data(num_shards, download_workers=8):
-    """Download training shards + pinned validation shard."""
-    os.makedirs(DATA_DIR, exist_ok=True)
-    num_train = min(num_shards, MAX_SHARD)
-    ids = list(range(num_train))
-    if VAL_SHARD not in ids:
-        ids.append(VAL_SHARD)
+def load_features(data_dir, dataset_name):
+    """Load feature CSV for a dataset. Returns DataFrame with pid, date, features."""
+    if dataset_name == ".":
+        path = os.path.join(data_dir, "rapids.csv")
+    else:
+        path = os.path.join(data_dir, dataset_name, "FeatureData", "rapids.csv")
+    df = pd.read_csv(path, parse_dates=["date"])
+    df["pid"] = df["pid"].astype(str)
+    df["dataset"] = dataset_name
+    return df
 
-    # Count what's already downloaded
-    existing = sum(1 for i in ids if os.path.exists(os.path.join(DATA_DIR, f"shard_{i:05d}.parquet")))
-    if existing == len(ids):
-        print(f"Data: all {len(ids)} shards already downloaded at {DATA_DIR}")
+
+def load_labels(data_dir, dataset_name):
+    """Load depression labels for a dataset. Returns DataFrame with pid, date, label."""
+    if dataset_name == ".":
+        path = os.path.join(data_dir, "dep_weekly.csv")
+    else:
+        path = os.path.join(data_dir, dataset_name, "SurveyData", "dep_weekly.csv")
+    df = pd.read_csv(path, parse_dates=["date"])
+    df["pid"] = df["pid"].astype(str)
+    # Binarize: score > threshold = depressed (1), else not (0)
+    df["label"] = (df["dep_endtotal"] > DEP_THRESHOLD).astype(int)
+    df["dataset"] = dataset_name
+    return df[["pid", "date", "label", "dataset"]]
+
+
+def construct_windows(features_df, labels_df, window_days=WINDOW_DAYS):
+    """
+    Construct (window_days, N_features) windows aligned to label dates.
+
+    For each label row (pid, date), we take the window_days days ending on that date
+    from the feature data. If fewer than window_days // 2 days are available, skip.
+
+    Returns:
+        X: np.ndarray of shape (N_samples, window_days, N_features)
+        y: np.ndarray of shape (N_samples,) int
+        pids: list of str (participant IDs, for splitting)
+    """
+    # Identify feature columns (everything except pid, date, dataset)
+    meta_cols = {"pid", "date", "dataset"}
+    feature_cols = sorted([c for c in features_df.columns if c not in meta_cols])
+    n_features = len(feature_cols)
+
+    # Index features by (pid, date)
+    features_df = features_df.sort_values(["pid", "date"])
+
+    X_list = []
+    y_list = []
+    pid_list = []
+
+    for _, label_row in labels_df.iterrows():
+        pid = label_row["pid"]
+        end_date = label_row["date"]
+        label = label_row["label"]
+        dataset = label_row["dataset"]
+
+        # Get this participant's features from the same dataset
+        mask = (features_df["pid"] == pid) & (features_df["dataset"] == dataset)
+        pid_features = features_df.loc[mask]
+        if pid_features.empty:
+            continue
+
+        # Window: (end_date - window_days + 1) to end_date inclusive
+        start_date = end_date - pd.Timedelta(days=window_days - 1)
+        window_mask = (pid_features["date"] >= start_date) & (pid_features["date"] <= end_date)
+        window = pid_features.loc[window_mask, feature_cols]
+
+        if len(window) < window_days // 2:
+            continue  # too much missing data
+
+        # Create full window with NaN for missing days
+        date_range = pd.date_range(start=start_date, end=end_date, freq="D")
+        pid_indexed = pid_features.set_index("date")
+        full_window = pid_indexed.reindex(date_range)[feature_cols]
+
+        # Forward fill then backward fill missing days, then fill remaining with 0
+        full_window = full_window.ffill().bfill().fillna(0)
+
+        X_list.append(full_window.values.astype(np.float32))
+        y_list.append(label)
+        pid_list.append(f"{dataset}_{pid}")
+
+    X = np.stack(X_list)
+    y = np.array(y_list, dtype=np.int64)
+    return X, y, pid_list, feature_cols
+
+
+def split_by_user(X, y, pids, test_ratio=TEST_RATIO, seed=42):
+    """80/20 per-user split. All windows from a user go to either train or test."""
+    rng = np.random.RandomState(seed)
+    unique_pids = sorted(set(pids))
+    rng.shuffle(unique_pids)
+
+    n_test = max(1, int(len(unique_pids) * test_ratio))
+    test_pids = set(unique_pids[:n_test])
+
+    pid_arr = np.array(pids)
+    test_mask = np.array([p in test_pids for p in pid_arr])
+    train_mask = ~test_mask
+
+    return (X[train_mask], y[train_mask]), (X[test_mask], y[test_mask])
+
+
+def compute_norm_stats(X_train):
+    """Compute per-feature mean and std from training data."""
+    # X_train: (N, 28, F)
+    flat = X_train.reshape(-1, X_train.shape[-1])
+    mean = np.nanmean(flat, axis=0)
+    std = np.nanstd(flat, axis=0)
+    std[std < 1e-8] = 1.0  # avoid division by zero
+    return mean.astype(np.float32), std.astype(np.float32)
+
+
+def normalize(X, mean, std):
+    """Z-score normalize."""
+    return ((X - mean) / std).astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Cache management
+# ---------------------------------------------------------------------------
+
+def get_cache_paths():
+    return {
+        "train_X": os.path.join(CACHE_DIR, "train_X.pt"),
+        "train_y": os.path.join(CACHE_DIR, "train_y.pt"),
+        "test_X": os.path.join(CACHE_DIR, "test_X.pt"),
+        "test_y": os.path.join(CACHE_DIR, "test_y.pt"),
+        "norm_mean": os.path.join(CACHE_DIR, "norm_mean.pt"),
+        "norm_std": os.path.join(CACHE_DIR, "norm_std.pt"),
+        "meta": os.path.join(CACHE_DIR, "meta.pt"),
+    }
+
+
+def cache_exists():
+    return all(os.path.exists(p) for p in get_cache_paths().values())
+
+
+def load_and_cache(data_dir=DATA_DIR):
+    """Load GLOBEM data, process, and cache as .pt files."""
+    global N_FEATURES
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    paths = get_cache_paths()
+
+    if cache_exists():
+        meta = torch.load(paths["meta"], weights_only=True)
+        N_FEATURES = int(meta["n_features"])
+        print(f"Data: cached tensors found at {CACHE_DIR} (n_features={N_FEATURES})")
         return
 
-    needed = len(ids) - existing
-    print(f"Data: downloading {needed} shards ({existing} already exist)...")
-
-    workers = max(1, min(download_workers, needed))
-    with Pool(processes=workers) as pool:
-        results = pool.map(download_single_shard, ids)
-
-    ok = sum(1 for r in results if r)
-    print(f"Data: {ok}/{len(ids)} shards ready at {DATA_DIR}")
-
-# ---------------------------------------------------------------------------
-# Tokenizer training
-# ---------------------------------------------------------------------------
-
-def list_parquet_files():
-    """Return sorted list of parquet file paths in the data directory."""
-    files = sorted(f for f in os.listdir(DATA_DIR) if f.endswith(".parquet") and not f.endswith(".tmp"))
-    return [os.path.join(DATA_DIR, f) for f in files]
-
-
-def text_iterator(max_chars=1_000_000_000, doc_cap=10_000):
-    """Yield documents from training split (all shards except pinned val shard)."""
-    parquet_paths = [p for p in list_parquet_files() if not p.endswith(VAL_FILENAME)]
-    nchars = 0
-    for filepath in parquet_paths:
-        pf = pq.ParquetFile(filepath)
-        for rg_idx in range(pf.num_row_groups):
-            rg = pf.read_row_group(rg_idx)
-            for text in rg.column("text").to_pylist():
-                doc = text[:doc_cap] if len(text) > doc_cap else text
-                nchars += len(doc)
-                yield doc
-                if nchars >= max_chars:
-                    return
-
-
-def train_tokenizer():
-    """Train BPE tokenizer using rustbpe, save as tiktoken pickle."""
-    tokenizer_pkl = os.path.join(TOKENIZER_DIR, "tokenizer.pkl")
-    token_bytes_path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
-
-    if os.path.exists(tokenizer_pkl) and os.path.exists(token_bytes_path):
-        print(f"Tokenizer: already trained at {TOKENIZER_DIR}")
-        return
-
-    os.makedirs(TOKENIZER_DIR, exist_ok=True)
-
-    parquet_files = list_parquet_files()
-    if len(parquet_files) < 2:
-        print("Tokenizer: need at least 2 data shards (1 train + 1 val). Download more data first.")
+    print(f"Data: loading GLOBEM from {data_dir}...")
+    datasets = find_datasets(data_dir)
+    if not datasets:
+        print(f"Error: no datasets found in {data_dir}")
+        print("Expected: subdirectories with FeatureData/rapids.csv and SurveyData/dep_weekly.csv")
         sys.exit(1)
+    print(f"  Found datasets: {datasets}")
 
-    # --- Train with rustbpe ---
-    print("Tokenizer: training BPE tokenizer...")
-    t0 = time.time()
+    # Load all datasets
+    all_features = []
+    all_labels = []
+    for ds in datasets:
+        print(f"  Loading {ds}...")
+        feat = load_features(data_dir, ds)
+        lab = load_labels(data_dir, ds)
+        all_features.append(feat)
+        all_labels.append(lab)
+        print(f"    Features: {len(feat)} rows, Labels: {len(lab)} rows")
 
-    tokenizer = rustbpe.Tokenizer()
-    vocab_size_no_special = VOCAB_SIZE - len(SPECIAL_TOKENS)
-    tokenizer.train_from_iterator(text_iterator(), vocab_size_no_special, pattern=SPLIT_PATTERN)
+    features_df = pd.concat(all_features, ignore_index=True)
+    labels_df = pd.concat(all_labels, ignore_index=True)
 
-    # Build tiktoken encoding from trained merges
-    pattern = tokenizer.get_pattern()
-    mergeable_ranks = {bytes(k): v for k, v in tokenizer.get_mergeable_ranks()}
-    tokens_offset = len(mergeable_ranks)
-    special_tokens = {name: tokens_offset + i for i, name in enumerate(SPECIAL_TOKENS)}
-    enc = tiktoken.Encoding(
-        name="rustbpe",
-        pat_str=pattern,
-        mergeable_ranks=mergeable_ranks,
-        special_tokens=special_tokens,
+    # Impute NaN features before windowing
+    meta_cols = {"pid", "date", "dataset"}
+    feature_cols_in_df = [c for c in features_df.columns if c not in meta_cols]
+    features_df[feature_cols_in_df] = features_df[feature_cols_in_df].fillna(
+        features_df[feature_cols_in_df].median()
     )
 
-    # Save tokenizer
-    with open(tokenizer_pkl, "wb") as f:
-        pickle.dump(enc, f)
+    print(f"  Total features: {len(features_df)} rows, {len(feature_cols_in_df)} feature columns")
+    print(f"  Total labels: {len(labels_df)} rows")
 
-    t1 = time.time()
-    print(f"Tokenizer: trained in {t1 - t0:.1f}s, saved to {tokenizer_pkl}")
+    # Construct windows
+    print("  Constructing 28-day windows...")
+    X, y, pids, feature_cols = construct_windows(features_df, labels_df)
+    N_FEATURES = X.shape[2]
+    print(f"  Windows: {X.shape[0]} samples, shape {X.shape}")
+    print(f"  Class balance: {y.mean():.1%} positive ({y.sum()}/{len(y)})")
 
-    # --- Build token_bytes lookup for BPB evaluation ---
-    print("Tokenizer: building token_bytes lookup...")
-    special_set = set(SPECIAL_TOKENS)
-    token_bytes_list = []
-    for token_id in range(enc.n_vocab):
-        token_str = enc.decode([token_id])
-        if token_str in special_set:
-            token_bytes_list.append(0)
-        else:
-            token_bytes_list.append(len(token_str.encode("utf-8")))
-    token_bytes_tensor = torch.tensor(token_bytes_list, dtype=torch.int32)
-    torch.save(token_bytes_tensor, token_bytes_path)
-    print(f"Tokenizer: saved token_bytes to {token_bytes_path}")
+    # Split by user
+    (X_train, y_train), (X_test, y_test) = split_by_user(X, y, pids)
+    print(f"  Train: {len(X_train)} samples, Test: {len(X_test)} samples")
 
-    # Sanity check
-    test = "Hello world! Numbers: 123. Unicode: 你好"
-    encoded = enc.encode_ordinary(test)
-    decoded = enc.decode(encoded)
-    assert decoded == test, f"Tokenizer roundtrip failed: {test!r} -> {decoded!r}"
-    print(f"Tokenizer: sanity check passed (vocab_size={enc.n_vocab})")
+    # Normalize using train stats
+    mean, std = compute_norm_stats(X_train)
+    X_train = normalize(X_train, mean, std)
+    X_test = normalize(X_test, mean, std)
+
+    # Save
+    torch.save(torch.from_numpy(X_train), paths["train_X"])
+    torch.save(torch.from_numpy(y_train), paths["train_y"])
+    torch.save(torch.from_numpy(X_test), paths["test_X"])
+    torch.save(torch.from_numpy(y_test), paths["test_y"])
+    torch.save(torch.from_numpy(mean), paths["norm_mean"])
+    torch.save(torch.from_numpy(std), paths["norm_std"])
+    torch.save({"n_features": N_FEATURES, "feature_cols": feature_cols}, paths["meta"])
+
+    print(f"  Cached to {CACHE_DIR}")
+    print(f"  n_features = {N_FEATURES}")
+
 
 # ---------------------------------------------------------------------------
 # Runtime utilities (imported by train.py)
 # ---------------------------------------------------------------------------
 
-class Tokenizer:
-    """Minimal tokenizer wrapper. Training is handled above."""
-
-    def __init__(self, enc):
-        self.enc = enc
-        self.bos_token_id = enc.encode_single_token(BOS_TOKEN)
-
-    @classmethod
-    def from_directory(cls, tokenizer_dir=TOKENIZER_DIR):
-        with open(os.path.join(tokenizer_dir, "tokenizer.pkl"), "rb") as f:
-            enc = pickle.load(f)
-        return cls(enc)
-
-    def get_vocab_size(self):
-        return self.enc.n_vocab
-
-    def get_bos_token_id(self):
-        return self.bos_token_id
-
-    def encode(self, text, prepend=None, num_threads=8):
-        if prepend is not None:
-            prepend_id = prepend if isinstance(prepend, int) else self.enc.encode_single_token(prepend)
-        if isinstance(text, str):
-            ids = self.enc.encode_ordinary(text)
-            if prepend is not None:
-                ids.insert(0, prepend_id)
-        elif isinstance(text, list):
-            ids = self.enc.encode_ordinary_batch(text, num_threads=num_threads)
-            if prepend is not None:
-                for row in ids:
-                    row.insert(0, prepend_id)
-        else:
-            raise ValueError(f"Invalid input type: {type(text)}")
-        return ids
-
-    def decode(self, ids):
-        return self.enc.decode(ids)
-
-
-def get_token_bytes(device="cpu"):
-    path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
-    with open(path, "rb") as f:
-        return torch.load(f, map_location=device)
-
-
-def _document_batches(split, tokenizer_batch_size=128):
-    """Infinite iterator over document batches from parquet files."""
-    parquet_paths = list_parquet_files()
-    assert len(parquet_paths) > 0, "No parquet files found. Run prepare.py first."
-    val_path = os.path.join(DATA_DIR, VAL_FILENAME)
+def _load_cached_split(split):
+    """Load cached tensors for a split."""
+    paths = get_cache_paths()
     if split == "train":
-        parquet_paths = [p for p in parquet_paths if p != val_path]
-        assert len(parquet_paths) > 0, "No training shards found."
+        X = torch.load(paths["train_X"], weights_only=True)
+        y = torch.load(paths["train_y"], weights_only=True)
     else:
-        parquet_paths = [val_path]
+        X = torch.load(paths["test_X"], weights_only=True)
+        y = torch.load(paths["test_y"], weights_only=True)
+    return X, y
+
+
+def get_n_features():
+    """Get the number of features per day from cached metadata."""
+    global N_FEATURES
+    if N_FEATURES is not None:
+        return N_FEATURES
+    paths = get_cache_paths()
+    meta = torch.load(paths["meta"], weights_only=True)
+    N_FEATURES = int(meta["n_features"])
+    return N_FEATURES
+
+
+def get_class_weights(device="cuda"):
+    """Compute inverse-frequency class weights from training labels."""
+    paths = get_cache_paths()
+    y = torch.load(paths["train_y"], weights_only=True)
+    counts = torch.bincount(y, minlength=NUM_CLASSES).float()
+    weights = counts.sum() / (NUM_CLASSES * counts)
+    return weights.to(device)
+
+
+def make_dataloader(batch_size, split):
+    """
+    Infinite dataloader for GLOBEM data.
+
+    Yields (x, y, epoch):
+        x: (B, WINDOW_DAYS, N_FEATURES) float32 on GPU
+        y: (B,) long on GPU
+        epoch: int (current epoch number)
+
+    Shuffles for train, sequential for test.
+    """
+    assert split in ["train", "test"]
+    X, y = _load_cached_split(split)
+    n = len(X)
+    device = torch.device("cuda")
+
     epoch = 1
     while True:
-        for filepath in parquet_paths:
-            pf = pq.ParquetFile(filepath)
-            for rg_idx in range(pf.num_row_groups):
-                rg = pf.read_row_group(rg_idx)
-                batch = rg.column('text').to_pylist()
-                for i in range(0, len(batch), tokenizer_batch_size):
-                    yield batch[i:i+tokenizer_batch_size], epoch
+        if split == "train":
+            perm = torch.randperm(n)
+        else:
+            perm = torch.arange(n)
+
+        for i in range(0, n - batch_size + 1, batch_size):
+            idx = perm[i:i + batch_size]
+            x_batch = X[idx].to(device, non_blocking=True)
+            y_batch = y[idx].to(device, non_blocking=True)
+            yield x_batch, y_batch, epoch
+
         epoch += 1
 
 
-def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
+def evaluate_model(model, batch_size):
     """
-    BOS-aligned dataloader with best-fit packing.
-    Every row starts with BOS. Documents packed using best-fit to minimize cropping.
-    When no document fits remaining space, crops shortest doc to fill exactly.
-    100% utilization (no padding).
+    Evaluate model on test set.
+
+    Returns dict with:
+        balanced_acc: balanced accuracy (primary metric)
+        roc_auc: area under ROC curve (secondary metric)
+
+    Implemented in pure PyTorch (no sklearn).
     """
-    assert split in ["train", "val"]
-    row_capacity = T + 1
-    batches = _document_batches(split)
-    bos_token = tokenizer.get_bos_token_id()
-    doc_buffer = []
-    epoch = 1
+    model.eval()
+    X, y = _load_cached_split("test")
+    device = torch.device("cuda")
+    n = len(X)
 
-    def refill_buffer():
-        nonlocal epoch
-        doc_batch, epoch = next(batches)
-        token_lists = tokenizer.encode(doc_batch, prepend=bos_token)
-        doc_buffer.extend(token_lists)
+    all_probs = []
+    all_preds = []
+    all_labels = []
 
-    # Pre-allocate buffers: [inputs (B*T) | targets (B*T)]
-    row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
-    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=True)
-    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device="cuda")
-    cpu_inputs = cpu_buffer[:B * T].view(B, T)
-    cpu_targets = cpu_buffer[B * T:].view(B, T)
-    inputs = gpu_buffer[:B * T].view(B, T)
-    targets = gpu_buffer[B * T:].view(B, T)
+    with torch.no_grad():
+        for i in range(0, n, batch_size):
+            end = min(i + batch_size, n)
+            x_batch = X[i:end].to(device)
+            y_batch = y[i:end]
 
-    while True:
-        for row_idx in range(B):
-            pos = 0
-            while pos < row_capacity:
-                while len(doc_buffer) < buffer_size:
-                    refill_buffer()
+            logits = model(x_batch)
+            probs = torch.softmax(logits.float(), dim=-1)[:, 1]  # P(positive)
+            preds = logits.argmax(dim=-1)
 
-                remaining = row_capacity - pos
+            all_probs.append(probs.cpu())
+            all_preds.append(preds.cpu())
+            all_labels.append(y_batch)
 
-                # Find largest doc that fits entirely
-                best_idx = -1
-                best_len = 0
-                for i, doc in enumerate(doc_buffer):
-                    doc_len = len(doc)
-                    if doc_len <= remaining and doc_len > best_len:
-                        best_idx = i
-                        best_len = doc_len
+    probs = torch.cat(all_probs)
+    preds = torch.cat(all_preds)
+    labels = torch.cat(all_labels)
 
-                if best_idx >= 0:
-                    doc = doc_buffer.pop(best_idx)
-                    row_buffer[row_idx, pos:pos + len(doc)] = torch.tensor(doc, dtype=torch.long)
-                    pos += len(doc)
-                else:
-                    # No doc fits — crop shortest to fill remaining
-                    shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i]))
-                    doc = doc_buffer.pop(shortest_idx)
-                    row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
-                    pos += remaining
+    # Balanced accuracy: mean of per-class recall
+    balanced_acc = _balanced_accuracy(preds, labels)
 
-        cpu_inputs.copy_(row_buffer[:, :-1])
-        cpu_targets.copy_(row_buffer[:, 1:])
-        gpu_buffer.copy_(cpu_buffer, non_blocking=True)
-        yield inputs, targets, epoch
+    # ROC-AUC (trapezoidal rule)
+    roc_auc = _roc_auc(probs, labels)
 
-# ---------------------------------------------------------------------------
-# Evaluation (DO NOT CHANGE — this is the fixed metric)
-# ---------------------------------------------------------------------------
+    return {"balanced_acc": balanced_acc, "roc_auc": roc_auc}
 
-@torch.no_grad()
-def evaluate_bpb(model, tokenizer, batch_size):
-    """
-    Bits per byte (BPB): vocab size-independent evaluation metric.
-    Sums per-token cross-entropy (in nats), sums target byte lengths,
-    then converts nats/byte to bits/byte. Special tokens (byte length 0)
-    are excluded from both sums.
-    Uses fixed MAX_SEQ_LEN so results are comparable across configs.
-    """
-    token_bytes = get_token_bytes(device="cuda")
-    val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
-    steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)
-    total_nats = 0.0
-    total_bytes = 0
-    for _ in range(steps):
-        x, y, _ = next(val_loader)
-        loss_flat = model(x, y, reduction='none').view(-1)
-        y_flat = y.view(-1)
-        nbytes = token_bytes[y_flat]
-        mask = nbytes > 0
-        total_nats += (loss_flat * mask).sum().item()
-        total_bytes += nbytes.sum().item()
-    return total_nats / (math.log(2) * total_bytes)
+
+def _balanced_accuracy(preds, labels):
+    """Balanced accuracy = mean of per-class recall."""
+    accs = []
+    for c in range(NUM_CLASSES):
+        mask = labels == c
+        if mask.sum() == 0:
+            continue
+        accs.append((preds[mask] == c).float().mean().item())
+    return sum(accs) / len(accs) if accs else 0.0
+
+
+def _roc_auc(probs, labels):
+    """ROC-AUC via trapezoidal rule. Returns 0.5 if single class."""
+    pos_mask = labels == 1
+    neg_mask = labels == 0
+    n_pos = pos_mask.sum().item()
+    n_neg = neg_mask.sum().item()
+
+    if n_pos == 0 or n_neg == 0:
+        return 0.5
+
+    # Sort by decreasing probability
+    sorted_idx = torch.argsort(probs, descending=True)
+    sorted_labels = labels[sorted_idx].float()
+
+    # Compute TPR and FPR at each threshold
+    tp = torch.cumsum(sorted_labels, dim=0)
+    fp = torch.cumsum(1 - sorted_labels, dim=0)
+    tpr = tp / n_pos
+    fpr = fp / n_neg
+
+    # Prepend (0, 0)
+    tpr = torch.cat([torch.zeros(1), tpr])
+    fpr = torch.cat([torch.zeros(1), fpr])
+
+    # Trapezoidal rule
+    auc = torch.trapezoid(tpr, fpr).item()
+    return auc
+
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Prepare data and tokenizer for autoresearch")
-    parser.add_argument("--num-shards", type=int, default=10, help="Number of training shards to download (-1 = all). Val shard is always pinned.")
-    parser.add_argument("--download-workers", type=int, default=8, help="Number of parallel download workers")
+    parser = argparse.ArgumentParser(description="Prepare GLOBEM data for autoresearch")
+    parser.add_argument("--data-dir", type=str, default=DATA_DIR,
+                        help="Path to GLOBEM data directory")
     args = parser.parse_args()
 
-    num_shards = MAX_SHARD if args.num_shards == -1 else args.num_shards
-
+    data_dir = args.data_dir
+    print(f"Data directory: {data_dir}")
     print(f"Cache directory: {CACHE_DIR}")
     print()
 
-    # Step 1: Download data
-    download_data(num_shards, download_workers=args.download_workers)
-    print()
-
-    # Step 2: Train tokenizer
-    train_tokenizer()
+    load_and_cache(data_dir)
     print()
     print("Done! Ready to train.")

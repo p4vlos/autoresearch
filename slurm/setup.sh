@@ -1,8 +1,19 @@
-#!/usr/bin/env bash
+#!/bin/bash
+#SBATCH --job-name=autoresearch-setup
+#SBATCH --output=slurm/setup-%j.out
+#SBATCH --error=slurm/setup-%j.err
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=32G
+#SBATCH --gres=gpu:v100:1
+#SBATCH --partition=GPU
+#SBATCH --time=00:10:00
+#SBATCH --mail-type=END,FAIL
+#SBATCH --mail-user=nicolaou.pavlos@ucy.ac.cy
 # One-time environment setup on the SLURM cluster.
-# Run this on the login node before submitting jobs.
 #
-# Usage: bash slurm/setup.sh
+# Usage: sbatch slurm/setup.sh
 
 set -euo pipefail
 

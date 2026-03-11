@@ -1,12 +1,16 @@
-#!/usr/bin/env bash
+#!/bin/bash
 #SBATCH --job-name=autoresearch
-#SBATCH --partition=gpu
-#SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=64G
-#SBATCH --time=00:15:00
 #SBATCH --output=results/slurm-%j.out
-#SBATCH --error=results/slurm-%j.out
+#SBATCH --error=results/slurm-%j.err
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=64G
+#SBATCH --gres=gpu:v100:1
+#SBATCH --partition=GPU
+#SBATCH --time=00:15:00
+#SBATCH --mail-type=END,FAIL
+#SBATCH --mail-user=nicolaou.pavlos@ucy.ac.cy
 
 set -euo pipefail
 
